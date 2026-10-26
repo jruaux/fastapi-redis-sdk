@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Annotated, Any, TypeAlias, cast
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 if TYPE_CHECKING:
     from redis_fastapi.cache_backend import CacheBackend, SyncCacheBackend
@@ -23,7 +25,7 @@ from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
 from redis.asyncio.sentinel import Sentinel as AsyncSentinel
 from redis.asyncio.sentinel import SentinelConnectionPool as AsyncSentinelPool
 
-from redis_fastapi.config import get_settings
+from redis_fastapi.config import RedisSettings, get_settings
 
 # Imported at runtime, not under TYPE_CHECKING, and that is load-bearing.
 # FastAPI resolves an endpoint's annotations with ``get_type_hints``, which
@@ -67,6 +69,10 @@ class _PoolState:
     async_cluster: AsyncRedisCluster | None = None
     async_sentinel: AsyncSentinel | None = None
     _async_client: AsyncRedis | None = None
+    stream_pool: AsyncConnectionPool | None = None
+    stream_cluster: AsyncRedisCluster | None = None
+    stream_sentinel: AsyncSentinel | None = None
+    _stream_client: AsyncRedis | None = None
 
     # Shared, pool-lifetime rate-limit capability cache (INCREX / EVAL support
     # and the registered Lua script).  Lazily created by
@@ -86,9 +92,9 @@ class _PoolState:
     # -- pool / cluster builders (static) -----------------------------------
 
     @staticmethod
-    def build_async_pool() -> AsyncConnectionPool:
+    def build_async_pool(settings: RedisSettings | None = None) -> AsyncConnectionPool:
         """Create an async ``ConnectionPool`` from settings (URL or KV)."""
-        settings = get_settings()
+        settings = settings if settings is not None else get_settings()
         kw = settings.connection_kwargs()
         url = kw.pop("url", None)
         if url is not None:
@@ -96,9 +102,9 @@ class _PoolState:
         return AsyncConnectionPool(**kw)
 
     @staticmethod
-    def build_async_cluster() -> AsyncRedisCluster:
+    def build_async_cluster(settings: RedisSettings | None = None) -> AsyncRedisCluster:
         """Create an async ``RedisCluster`` from settings."""
-        settings = get_settings()
+        settings = settings if settings is not None else get_settings()
         kw = settings.connection_kwargs()
         url = kw.pop("url", None)
         if url is not None:
@@ -106,13 +112,15 @@ class _PoolState:
         return AsyncRedisCluster(**kw)
 
     @staticmethod
-    def build_async_sentinel() -> tuple[AsyncSentinel, AsyncSentinelPool]:
+    def build_async_sentinel(
+        settings: RedisSettings | None = None,
+    ) -> tuple[AsyncSentinel, AsyncSentinelPool]:
         """Create a ``Sentinel`` and a pool of connections to its primary.
 
         The pool asks the Sentinels for the primary's address on every new
         connection, so clients follow a failover without a restart.
         """
-        settings = get_settings()
+        settings = settings if settings is not None else get_settings()
         sentinel = AsyncSentinel(  # type: ignore[no-untyped-call]
             settings.sentinel_addresses(),
             sentinel_kwargs=settings.sentinel_kwargs(),
@@ -123,6 +131,73 @@ class _PoolState:
             **settings.sentinel_connection_kwargs(),
         )
         return sentinel, pool
+
+    def start_stream_reader(self) -> None:
+        """Create bounded, independent resources using the same connection identity."""
+        settings = get_settings()
+        url = settings.url
+        if url is not None:
+            # redis-py gives URL query values precedence over keyword arguments.
+            # The reader's explicit cap must win over an ordinary command-pool cap.
+            parts = urlsplit(url)
+            query = [
+                (k, v)
+                for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                if k != "max_connections"
+            ]
+            url = urlunsplit(parts._replace(query=urlencode(query)))
+        reader_settings = settings.model_copy(
+            update={
+                "max_connections": settings.stream_reader_max_connections,
+                "url": url,
+            }
+        )
+        if reader_settings.cluster:
+            self.stream_cluster = self.build_async_cluster(reader_settings)
+        elif reader_settings.sentinel:
+            self.stream_sentinel, self.stream_pool = self.build_async_sentinel(
+                reader_settings
+            )
+        else:
+            self.stream_pool = self.build_async_pool(reader_settings)
+        # Validate the effective timeout, including URL query overrides.
+        source = (
+            self.stream_cluster if self.stream_cluster is not None else self.stream_pool
+        )
+        kwargs = getattr(source, "connection_kwargs", {})
+        timeout = kwargs.get("socket_timeout")
+        if timeout is not None and timeout <= settings.stream_heartbeat_seconds:
+            from redis_fastapi.exceptions import StreamConfigurationError
+
+            raise StreamConfigurationError(
+                "reader socket_timeout must be longer than stream_heartbeat_seconds"
+            )
+
+    def get_stream_reader(self) -> AsyncClient:
+        if self.stream_cluster is not None:
+            return self.stream_cluster
+        if self.stream_pool is None:
+            raise RuntimeError("stream reader pool is not initialized")
+        if self._stream_client is None:
+            self._stream_client = AsyncRedis(connection_pool=self.stream_pool)
+        return self._stream_client
+
+    async def close_stream_reader(self) -> None:
+        """Close only the resources created for streaming reads."""
+        try:
+            async with AsyncExitStack() as cleanup:
+                if self.stream_sentinel is not None:
+                    for node in self.stream_sentinel.sentinels:
+                        cleanup.push_async_callback(node.aclose)
+                if self.stream_pool is not None:
+                    cleanup.push_async_callback(self.stream_pool.aclose)
+                if self.stream_cluster is not None:
+                    cleanup.push_async_callback(self.stream_cluster.aclose)
+        finally:
+            self.stream_cluster = None
+            self.stream_pool = None
+            self.stream_sentinel = None
+            self._stream_client = None
 
     # -- client accessors ---------------------------------------------------
 

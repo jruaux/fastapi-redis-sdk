@@ -652,6 +652,9 @@ class StreamBackend:
             follows the application's pool.
         coder: Serializer for event payloads.  Defaults to :class:`JsonCoder`.
         capabilities: Shared server-support cache.
+        blocking_client: Optional factory for independent blocking-read resources.
+            Fluent setup supplies a bounded reader pool. Direct construction keeps
+            its existing shared-client behavior unless this factory is provided.
     """
 
     def __init__(
@@ -660,8 +663,10 @@ class StreamBackend:
         *,
         coder: type[Coder] | None = None,
         capabilities: _StreamCapabilities | None = None,
+        blocking_client: Callable[[], AsyncClient] | None = None,
     ) -> None:
         self._client = client
+        self._blocking_client = blocking_client
         self._coder: type[Coder] = coder or JsonCoder
         self._caps = capabilities if capabilities is not None else _StreamCapabilities()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -1193,7 +1198,12 @@ class StreamBackend:
             if self._closing:
                 return  # shutting down: close, and the client reconnects
             try:
-                reply = await self._client().xread(
+                reader = (
+                    self._blocking_client()
+                    if self._blocking_client is not None
+                    else self._client()
+                )
+                reply = await reader.xread(
                     {plan.keys.stream: _format(cursor)},
                     count=settings.stream_replay_page,
                     block=int(settings.stream_heartbeat_seconds * 1000),
@@ -1299,7 +1309,11 @@ class StreamBackend:
         self._closing = False
 
     def _reserve_reader(self) -> bool:
-        if self._closing or self._readers >= get_settings().stream_max_readers:
+        settings = get_settings()
+        limit = settings.stream_max_readers
+        if self._blocking_client is not None:
+            limit = min(limit, settings.stream_reader_max_connections)
+        if self._closing or self._readers >= limit:
             return False
         self._readers += 1
         add_stream_readers(1)

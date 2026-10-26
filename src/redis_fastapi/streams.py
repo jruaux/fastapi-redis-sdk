@@ -352,7 +352,9 @@ def add_redis_streams(
     from redis_fastapi.deps import _get_pool_state
 
     backend = StreamBackend(
-        lambda: _get_pool_state(app).get_async_client(), coder=coder
+        lambda: _get_pool_state(app).get_async_client(),
+        coder=coder,
+        blocking_client=lambda: _get_pool_state(app).get_stream_reader(),
     )
     app.state._redis_streams = backend
     for cls in _STATUS:

@@ -397,6 +397,11 @@ class RedisSettings(BaseSettings):
         gt=0,
         description="Entries per read (XREAD COUNT).",
     )
+    stream_reader_max_connections: int = Field(
+        default=256,
+        gt=0,
+        description="Dedicated blocking-reader connection limit (per node in Cluster mode).",
+    )
     stream_max_readers: int = Field(
         default=256,
         gt=0,

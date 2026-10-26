@@ -590,3 +590,12 @@ export REDIS_URL=rediss://localhost:6380/0
 export REDIS_SSL_CHECK_HOSTNAME=false
 ```
 
+
+### Dedicated stream-reader connections
+
+`REDIS_STREAM_READER_MAX_CONNECTIONS` is a positive integer, default `256`. It
+bounds the fluent streaming setup's independent blocking-read pool (per node in
+OSS Cluster). `REDIS_MAX_CONNECTIONS` continues to configure ordinary commands.
+SSE reader admission uses the smaller of this cap and `REDIS_STREAM_MAX_READERS`.
+Database identity, authentication, TLS and topology match the command connection.
+A `max_connections` parameter in `REDIS_URL` cannot override the reader-specific cap.

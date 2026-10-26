@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI
@@ -179,6 +179,7 @@ async def _start_streams(app: FastAPI, ps: _PoolState) -> Any:
         return None
     from redis_fastapi.stream_backend import _StreamCapabilities
 
+    ps.start_stream_reader()
     ps.stream_capabilities = _StreamCapabilities()
     backend._start(ps.stream_capabilities)
     try:
@@ -222,37 +223,45 @@ async def redis_lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     ps = _PoolState()
     app.state._redis = ps
 
-    if settings.cluster:
-        ps.async_cluster = _PoolState.build_async_cluster()
-    elif settings.sentinel:
-        ps.async_sentinel, ps.async_pool = _PoolState.build_async_sentinel()
-    else:
-        ps.async_pool = _PoolState.build_async_pool()
-
-    if getattr(app.state, "_redis_rate_limiting", False):
-        await _probe_rate_limit_capabilities(ps)
-
-    if getattr(app.state, "_redis_caching", False):
-        await _check_cache_eviction_safety(ps)
-
-    streams = await _start_streams(app, ps)
-
+    streams = None
     try:
+        if settings.cluster:
+            ps.async_cluster = _PoolState.build_async_cluster()
+        elif settings.sentinel:
+            ps.async_sentinel, ps.async_pool = _PoolState.build_async_sentinel()
+        else:
+            ps.async_pool = _PoolState.build_async_pool()
+
+        if getattr(app.state, "_redis_rate_limiting", False):
+            await _probe_rate_limit_capabilities(ps)
+
+        if getattr(app.state, "_redis_caching", False):
+            await _check_cache_eviction_safety(ps)
+
+        streams = getattr(app.state, "_redis_streams", None)
+        await _start_streams(app, ps)
+
         yield
     finally:
-        if streams is not None:
-            # Before the pool closes: cancelled producers write their final
-            # entries, and live readers close.
-            await streams.aclose()
-        ps.clear()
-        if settings.cluster:
-            await ps.async_cluster.aclose()  # type: ignore[union-attr]
-            ps.async_cluster = None
-        else:
-            await ps.async_pool.aclose()  # type: ignore[union-attr]
-            ps.async_pool = None
-        if ps.async_sentinel is not None:
-            for node in ps.async_sentinel.sentinels:
-                await node.aclose()
-            ps.async_sentinel = None
-        _shutdown_redis_otel(otel_instance)
+        # Run every cleanup even if one close raises or startup is cancelled.
+        # Registration order gives backend -> reader -> command -> telemetry.
+        async with AsyncExitStack() as cleanup:
+            cleanup.callback(_shutdown_redis_otel, otel_instance)
+            if ps.async_sentinel is not None:
+                for node in ps.async_sentinel.sentinels:
+                    cleanup.push_async_callback(node.aclose)
+            if ps.async_pool is not None:
+                cleanup.push_async_callback(ps.async_pool.aclose)
+            if ps.async_cluster is not None:
+                cleanup.push_async_callback(ps.async_cluster.aclose)
+
+            def clear_command_state() -> None:
+                ps.clear()
+                ps.async_pool = None
+                ps.async_cluster = None
+                ps.async_sentinel = None
+
+            cleanup.callback(clear_command_state)
+            cleanup.push_async_callback(ps.close_stream_reader)
+            if streams is not None:
+                cleanup.push_async_callback(streams.aclose)

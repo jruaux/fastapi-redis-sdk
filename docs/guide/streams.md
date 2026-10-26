@@ -352,10 +352,15 @@ events.addEventListener("stream.error", (e) => {
 - **Slow clients.** A send that waits longer than `stream_send_timeout_seconds`
   closes the response, so a frozen tab does not hold a slot. A dead client on
   an idle stream is not caught this way; the connection cap bounds that case.
-- **Connections.** Each live reader holds a pool connection for each blocking
-  read. With `REDIS_MAX_CONNECTIONS` set, size it for `stream_max_readers` plus
-  your other traffic. The driver's `socket_timeout` must be longer than
-  `stream_heartbeat_seconds`; `.streams()` refuses a setup where it is not.
+- **Connections.** Fluent `.lifespan().streams()` uses a dedicated bounded
+  pool for blocking reads. `REDIS_STREAM_READER_MAX_CONNECTIONS` defaults to
+  256 (per node in OSS Cluster); `REDIS_MAX_CONNECTIONS` controls the separate
+  ordinary-command pool. Idle subscriptions cannot occupy command connections.
+  SSE admission is capped by the smaller of `stream_max_readers` and
+  `stream_reader_max_connections`, returning 503 before headers when full.
+  The reader's effective socket timeout, including URL query overrides, must
+  exceed `stream_heartbeat_seconds`. Direct backend construction retains its
+  existing client behavior unless a `blocking_client` factory is supplied.
 - **Redis failover.** Replication is asynchronous, so a failover can lose
   entries the old primary had acknowledged. A reader whose cursor is past the
   loss gets `409`; one behind it sees a `stream.gap`.
@@ -413,6 +418,7 @@ Every setting is an environment variable prefixed `REDIS_`, so
 | `stream_heartbeat_seconds`      | `15`     | SSE ping, blocking-read bound, producer heartbeat                    |
 | `stream_alive_ttl_seconds`      | `45`     | Lifetime of the producer heartbeat key; longer than the heartbeat    |
 | `stream_replay_page`            | `100`    | Entries per read                                                     |
+| `stream_reader_max_connections` | `256` | Dedicated blocking pool cap; per node in OSS Cluster |
 | `stream_max_readers`            | `256`    | Live SSE readers per process                                         |
 | `stream_max_connection_seconds` | `300`    | Longest SSE connection before the client reconnects                  |
 | `stream_read_retry_seconds`     | `30`     | How long a reader retries a failing Redis read                       |
@@ -426,3 +432,25 @@ With [telemetry](observability.md) enabled, the feature emits
 `redis_fastapi.streams.operations` (by operation and result),
 `redis_fastapi.streams.latency` and the `redis_fastapi.streams.readers` gauge.
 No scope, stream ID or event data becomes a label.
+
+## Blocking-reader resource ownership
+
+The fluent setup resolves the same database, credentials, TLS and topology for
+both pools. Its reader cap overrides a command-pool `max_connections` URL query
+parameter, without changing that URL or the ordinary pool's configuration.
+Standalone, OSS Cluster and Sentinel get independent reader resources. No reader
+pool is constructed when streams are not registered. The lifespan closes producer
+work first, then reader resources, then ordinary Redis resources; startup errors
+and cancellation clean up both pools. A failing close does not skip later cleanup.
+
+There is still one blocking read per subscriber, not a shared relay. Non-HTTP
+`follow()` callers manage their own iterator concurrency; the underlying reader
+pool remains bounded. This does not qualify failover, Sentinel recovery or capacity.
+
+`test_stream_reader_pool.py` exercises a blocked read alongside a one-connection
+command pool, pre-header overload admission, connection construction and teardown.
+Set `STREAMS_TEST_CLUSTER_URL` or `STREAMS_TEST_ENTERPRISE_URL` to include explicitly
+supplied test endpoints; missing endpoints are reported as skipped. Tests remove
+only their random `stream-regression:` namespace and use `CLIENT LIST` to observe
+blocked reads. The baseline Cluster initial-replay issue remains covered by the
+separate explicit-injection PR; pool tests isolate the blocking path from it.
