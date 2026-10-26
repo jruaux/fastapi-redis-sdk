@@ -37,6 +37,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 from redis.asyncio import Redis as AsyncRedis
@@ -50,9 +51,9 @@ from redis.exceptions import (
 )
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from redis_fastapi.config import get_settings
 from redis_fastapi.exceptions import (
     StreamBusy,
+    StreamConfigurationError,
     StreamCursorAhead,
     StreamError,
     StreamExpired,
@@ -64,6 +65,7 @@ from redis_fastapi.exceptions import (
     StreamStoreError,
     StreamUnsupported,
 )
+from redis_fastapi.stream_settings import StreamSettings
 from redis_fastapi.telemetry import (
     add_stream_readers,
     record_stream_operation,
@@ -246,19 +248,18 @@ class _Keys:
     active: str
 
 
-def _active_key(scope: str) -> str:
-    return f"{get_settings().prefix}:stream-active:{{{scope}}}"
+def _active_key(scope: str, prefix: str = "redis:fastapi") -> str:
+    return f"{prefix}:stream-active:{{{scope}}}"
 
 
-def _keys(scope: str, stream_id: str) -> _Keys:
+def _keys(scope: str, stream_id: str, prefix: str = "redis:fastapi") -> _Keys:
     # Every key of a run, and the scope's active slot, hash on the scope, so
     # they share one Cluster slot and one transaction can cover them all.
-    prefix = get_settings().prefix
     tag = f"{{{scope}}}:{stream_id}"
     return _Keys(
         stream=f"{prefix}:stream:{tag}",
         meta=f"{prefix}:stream-meta:{tag}",
-        active=_active_key(scope),
+        active=_active_key(scope, prefix),
     )
 
 
@@ -414,7 +415,7 @@ class StreamWriter:
         self.scope = scope
         self.stream_id = stream_id
         self.created = created
-        self._keys = _keys(scope, stream_id)
+        self._keys = _keys(scope, stream_id, backend.settings.prefix)
         self._writer_id = writer_id
         self._exclusive = exclusive
         self._seq = seq
@@ -519,7 +520,7 @@ class StreamWriter:
         if self._final_id is not None:
             raise StreamFinished(f"stream {self.stream_id} already ended")
         seconds = _seconds(ttl)
-        gone = get_settings().stream_gone_ttl
+        gone = self._backend.settings.stream_gone_ttl
         client = self._backend._client()
         try:
             pipe = client.pipeline(transaction=True)
@@ -553,7 +554,7 @@ class StreamWriter:
                 await beat
 
     async def _beat(self) -> None:
-        settings = get_settings()
+        settings = self._backend.settings
         while True:
             await asyncio.sleep(settings.stream_heartbeat_interval)
             client = self._backend._client()
@@ -607,7 +608,7 @@ class StreamWriter:
     async def _write(
         self, type: str, payload: str, seq: int, *, final: bool
     ) -> tuple[str, bool]:
-        settings = get_settings()
+        settings = self._backend.settings
         keys = self._keys
         ttl = settings.stream_done_ttl if final else settings.stream_active_ttl
         args = _xadd(
@@ -618,6 +619,7 @@ class StreamWriter:
             seq=seq,
             final=final,
             nomkstream=self._started,
+            maxlen=settings.stream_maxlen,
         )
 
         def build(pipe: Any) -> None:
@@ -630,6 +632,7 @@ class StreamWriter:
                 final=final,
                 started=self._started,
                 exclusive=self._exclusive,
+                settings=settings,
             )
 
         # An append checks the fence after the fact, in the same transaction:
@@ -669,6 +672,7 @@ def _xadd(
     seq: int | None,
     final: bool,
     nomkstream: bool,
+    maxlen: int,
 ) -> list[Any]:
     """The ``XADD`` for one entry, shared by every path that writes one.
 
@@ -680,7 +684,7 @@ def _xadd(
     if nomkstream:
         args.append("NOMKSTREAM")
     args += ["IDMP", *idmp]
-    args += ["MAXLEN", "~", str(get_settings().stream_maxlen), "*"]
+    args += ["MAXLEN", "~", str(maxlen), "*"]
     args += [F_TYPE, type, F_DATA, payload]
     if seq is not None:
         args += [F_SEQ, str(seq)]
@@ -722,8 +726,8 @@ def _build_write(
     final: bool,
     started: bool,
     exclusive: bool,
+    settings: StreamSettings,
 ) -> None:
-    settings = get_settings()
     gone = settings.stream_gone_ttl
     pipe.execute_command(*args)
     if not started:
@@ -757,6 +761,7 @@ class _ReadPlan:
     stream_id: str
     cursor: Cursor
     last_seq: int | None
+    generation: int
     first: list[tuple[Any, dict[Any, Any]]] = field(default_factory=list)
 
 
@@ -791,6 +796,10 @@ class StreamReader:
         return self
 
     async def __anext__(self) -> StreamEvent:
+        plan = self._plan
+        if plan is not None and plan.generation != self._backend._generation:
+            # The backend restarted: drop what the old lifecycle buffered.
+            await self.aclose()
         while not self._buffer:
             if self._plan is None:
                 raise StopAsyncIteration
@@ -827,14 +836,16 @@ class StreamReader:
 class StreamBackend:
     """Resumable streams backed by Redis.
 
-    There is one instance per process.  ``FastAPIRedis(app).streams()``
-    creates it, and :data:`~redis_fastapi.deps.StreamBackendDep` returns it.
-    It holds state for the whole process: the tasks started by :meth:`spawn`,
+    ``FastAPIRedis(app).streams()`` creates one per app, or applications can
+    supply their own backend. It holds the tasks started by :meth:`spawn`,
     the live reader count and the server-support result.
 
     Args:
-        client: A callable returning the async Redis client, so the backend
-            follows the application's pool.
+        client: Application-owned async Redis client, or a factory returning it.
+        settings: Environment-free stream policy. Defaults to StreamSettings().
+        blocking_client: Optional separate client for blocking reads. It must use
+            an independent pool and the same database and identity as client.
+            Without it, readers share the command pool; size that pool accordingly.
         coder: Serializer for event payloads.  Defaults to
             :class:`~redis_fastapi.types.JsonableCoder`.
         capabilities: Shared server-support cache.
@@ -842,12 +853,32 @@ class StreamBackend:
 
     def __init__(
         self,
-        client: Callable[[], AsyncClient],
+        client: AsyncClient | Callable[[], AsyncClient],
         *,
+        settings: StreamSettings | None = None,
+        blocking_client: AsyncClient | None = None,
         coder: type[Coder] | None = None,
         capabilities: _StreamCapabilities | None = None,
     ) -> None:
-        self._client = client
+        # Keep factory support for the environment-managed pool adapter.
+        if isinstance(client, (AsyncRedis, AsyncRedisCluster)):
+            self._client: Callable[[], AsyncClient] = lambda: client
+        elif callable(client):
+            self._client = client
+        else:
+            raise StreamConfigurationError(
+                "client must be an async Redis client or factory"
+            )
+        if blocking_client is not None and not isinstance(
+            blocking_client, (AsyncRedis, AsyncRedisCluster)
+        ):
+            raise StreamConfigurationError(
+                "blocking_client must be an async Redis client"
+            )
+        self.settings = settings if settings is not None else StreamSettings()
+        self._blocking_client = blocking_client
+        self._running = False
+        self._generation = 0
         self._coder: type[Coder] = coder or JsonableCoder
         self._caps = capabilities if capabilities is not None else _StreamCapabilities()
         self._tasks: set[asyncio.Task[None]] = set()
@@ -892,7 +923,7 @@ class StreamBackend:
 
     def _encode(self, data: Any) -> str:
         payload = self._coder.encode(data)
-        limit = get_settings().stream_max_event_bytes
+        limit = self.settings.stream_max_event_bytes
         if len(payload.encode()) > limit:
             raise ValueError(
                 f"event of {len(payload.encode())} bytes exceeds "
@@ -975,7 +1006,7 @@ class StreamBackend:
         expiry.  ``EXPIRE ... NX`` sets a TTL only on a key that has none, so
         it repairs exactly that case and leaves a live meta's TTL alone.
         """
-        settings = get_settings()
+        settings = self.settings
         pipe = self._client().pipeline(transaction=True)
         pipe.hset(keys.meta, mapping=mapping)
         pipe.expire(
@@ -1011,7 +1042,7 @@ class StreamBackend:
         await self._require_support()
         check_name(scope, stream_id)
         sid = stream_id or secrets.token_urlsafe(12)
-        keys = _keys(scope, sid)
+        keys = _keys(scope, sid, self.settings.prefix)
         writer_id = _new_writer_id()
         with stream_span("redis_fastapi.streams.open"), timed_stream("open"):
             try:
@@ -1077,7 +1108,7 @@ class StreamBackend:
             StreamBusy: If the slot names another run.
             StreamStoreError: If the keys kept changing between attempts.
         """
-        settings = get_settings()
+        settings = self.settings
         client = self._client()
         watched = [keys.active, keys.meta] if exclusive else [keys.meta]
         for attempt in range(_WRITE_ATTEMPTS):
@@ -1149,7 +1180,7 @@ class StreamBackend:
         """
         await self._require_support()
         check_name(scope, stream_id)
-        keys = _keys(scope, stream_id)
+        keys = _keys(scope, stream_id, self.settings.prefix)
         client = self._client()
         try:
             pipe = client.pipeline(transaction=True)
@@ -1279,7 +1310,7 @@ class StreamBackend:
         """
         await self._require_support()
         check_name(scope, stream_id)
-        keys = _keys(scope, stream_id)
+        keys = _keys(scope, stream_id, self.settings.prefix)
         try:
             status = _text(await self._client().hget(keys.meta, M_STATUS))
             if status is None:
@@ -1304,7 +1335,9 @@ class StreamBackend:
         await self._require_support()
         check_name(scope)
         try:
-            return _text(await self._client().get(_active_key(scope)))
+            return _text(
+                await self._client().get(_active_key(scope, self.settings.prefix))
+            )
         except STORE_ERRORS as exc:
             raise StreamStoreError("could not read the active run") from exc
 
@@ -1381,10 +1414,11 @@ class StreamBackend:
         as one transaction, so the checks and the first page are one snapshot
         and no trim can fall between them.
         """
+        generation = self._generation
         check_name(scope, stream_id)
         cursor = parse_cursor(after) if after is not None else _START
-        keys = _keys(scope, stream_id)
-        page = get_settings().stream_replay_page
+        keys = _keys(scope, stream_id, self.settings.prefix)
+        page = self.settings.stream_replay_page
 
         def build(pipe: Any) -> None:
             pipe.hgetall(keys.meta)
@@ -1457,6 +1491,7 @@ class StreamBackend:
             stream_id=stream_id,
             cursor=cursor,
             last_seq=last_seq,
+            generation=generation,
             first=first,
         )
 
@@ -1470,13 +1505,15 @@ class StreamBackend:
         No blocking read runs past *deadline*, so a caller that stops there
         stops on time.  The page with the final entry is the last.
         """
-        settings = get_settings()
+        settings = self.settings
         heartbeat_ms = settings.stream_heartbeat_interval * 1000  # BLOCK is in ms
         cursor = plan.cursor
         last_seq = plan.last_seq
         pending = plan.first
         failing_since: float | None = None
         while True:
+            if self._closing or plan.generation != self._generation:
+                return
             if pending:
                 page: list[_Entry] = []
                 for raw_id, raw_fields in pending:
@@ -1505,7 +1542,7 @@ class StreamBackend:
                     continue
                 block_ms = min(block_ms, left_ms)
             try:
-                reply = await self._client().xread(
+                reply = await self._reader().xread(
                     {plan.keys.stream: _format(cursor)},
                     count=settings.stream_replay_page,
                     block=max(1, block_ms),  # BLOCK 0 would wait forever
@@ -1520,6 +1557,8 @@ class StreamBackend:
                 await asyncio.sleep(min(1.0, block_ms / 1000))
                 yield []
                 continue
+            if self._closing or plan.generation != self._generation:
+                return
             pending = _xread_entries(reply)
             if pending:
                 continue
@@ -1577,7 +1616,7 @@ class StreamBackend:
         appended has no stream yet, and gets one holding only the end.
         Returns ``None`` when the stream is gone.
         """
-        settings = get_settings()
+        settings = self.settings
         keys = plan.keys
         payload = self._encode({"reason": "producer_lost"})
         args = _xadd(
@@ -1588,6 +1627,7 @@ class StreamBackend:
             seq=None,
             final=True,
             nomkstream=started,
+            maxlen=settings.stream_maxlen,
         )
         pipe = self._client().pipeline(transaction=True)
         _build_write(
@@ -1599,6 +1639,7 @@ class StreamBackend:
             final=True,
             started=started,
             exclusive=False,
+            settings=settings,
         )
         replies = await pipe.execute()
         final_id = _text(replies[0])
@@ -1609,13 +1650,78 @@ class StreamBackend:
 
     # -- readers and lifecycle -----------------------------------------------
 
+    def _reader(self) -> AsyncClient:
+        return (
+            self._blocking_client
+            if self._blocking_client is not None
+            else self._client()
+        )
+
+    def _check_clients(self) -> None:
+        command = self._client()
+        reader = self._reader()
+        if self._blocking_client is not None:
+            command_pool = getattr(command, "connection_pool", None)
+            reader_pool = getattr(reader, "connection_pool", None)
+            if command is reader or (
+                command_pool is not None and command_pool is reader_pool
+            ):
+                raise StreamConfigurationError(
+                    "blocking_client must use an independent pool"
+                )
+        pool = getattr(reader, "connection_pool", None)
+        kwargs = getattr(pool, "connection_kwargs", None)
+        if not isinstance(kwargs, dict):
+            kwargs = getattr(reader, "connection_kwargs", {})
+        timeout = kwargs.get("socket_timeout") if isinstance(kwargs, dict) else None
+        if timeout is not None and timeout <= self.settings.stream_heartbeat_interval:
+            raise StreamConfigurationError(
+                "socket_timeout must be longer than stream_heartbeat_interval"
+            )
+
+    async def initialize(self) -> None:
+        """Start this backend without creating or taking ownership of clients.
+
+        Support detection preserves the fluent setup's best-effort behavior:
+        unsupported servers disable streams; unreachable servers are retried on use.
+        """
+        if self._running:
+            raise StreamConfigurationError(
+                "the stream backend already has a lifecycle owner"
+            )
+        self._check_clients()
+        self._start(_StreamCapabilities())
+        try:
+            await self.detect()
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def __aenter__(self) -> StreamBackend:
+        await self.initialize()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
     def _start(self, capabilities: _StreamCapabilities) -> None:
         """Bind to a freshly built pool.  Called by the lifespan at startup."""
+        if self._running:
+            raise StreamConfigurationError(
+                "the stream backend already has a lifecycle owner"
+            )
         self._caps = capabilities
+        self._generation += 1
         self._closing = False
+        self._running = True
 
     def _reserve_reader(self) -> bool:
-        if self._closing or self._readers >= get_settings().stream_max_readers:
+        if self._closing or self._readers >= self.settings.stream_max_readers:
             return False
         self._readers += 1
         add_stream_readers(1)
@@ -1633,29 +1739,34 @@ class StreamBackend:
         before the connection pool closes.
         """
         self._closing = True
-        # Let producers spawned a moment ago start first: a task cancelled
-        # before it runs never writes its final entry.
-        await asyncio.sleep(0)
-        pending = set(self._tasks)
-        self._cancel_unless_ending(pending)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _SHUTDOWN_GRACE_SECONDS
-        while pending:
-            _, pending = await asyncio.wait(pending, timeout=_SHUTDOWN_RETRY_SECONDS)
-            if not pending:
-                break
-            if loop.time() >= deadline:
-                logger.warning(
-                    "%d stream producer(s) did not stop within %.0f s of "
-                    "shutdown; their readers will see producer_lost",
-                    len(pending),
-                    _SHUTDOWN_GRACE_SECONDS,
-                )
-                break
-            # On Python 3.10 and 3.11 asyncio.wait_for, which redis-py uses
-            # for socket writes, can lose a cancel that arrives as the write
-            # completes.  Repeat it.
+        try:
+            # Let producers spawned a moment ago start first: a task cancelled
+            # before it runs never writes its final entry.
+            await asyncio.sleep(0)
+            pending = set(self._tasks)
             self._cancel_unless_ending(pending)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _SHUTDOWN_GRACE_SECONDS
+            while pending:
+                _, pending = await asyncio.wait(
+                    pending, timeout=_SHUTDOWN_RETRY_SECONDS
+                )
+                if not pending:
+                    break
+                if loop.time() >= deadline:
+                    logger.warning(
+                        "%d stream producer(s) did not stop within %.0f s of "
+                        "shutdown; their readers will see producer_lost",
+                        len(pending),
+                        _SHUTDOWN_GRACE_SECONDS,
+                    )
+                    break
+                # On Python 3.10 and 3.11 asyncio.wait_for, which redis-py uses
+                # for socket writes, can lose a cancel that arrives as the write
+                # completes.  Repeat it.
+                self._cancel_unless_ending(pending)
+        finally:
+            self._running = False
 
     def _cancel_unless_ending(self, tasks: set[asyncio.Task[None]]) -> None:
         """Cancel spawned producers, except one already writing its final entry.

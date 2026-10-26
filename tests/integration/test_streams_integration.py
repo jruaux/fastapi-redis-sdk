@@ -36,6 +36,7 @@ from redis_fastapi import (
     StreamFenced,
     StreamFinished,
     StreamNotFound,
+    StreamSettings,
     StreamWriter,
 )
 from redis_fastapi.config import get_settings
@@ -99,7 +100,10 @@ async def backend(
     settings_env: Callable[..., None], real_async_redis: async_redis.Redis
 ) -> StreamBackend:
     """A backend on a real async client, outside any app."""
-    instance = StreamBackend(lambda: real_async_redis)
+    instance = StreamBackend(
+        lambda: real_async_redis,
+        settings=StreamSettings.from_redis_settings(get_settings()),
+    )
     instance._start(_StreamCapabilities())
     assert await instance.detect() is True
     return instance
@@ -876,7 +880,10 @@ class TestBackend:
         scope: str,
     ) -> None:
         settings_env(stream_done_ttl=60, stream_gone_ttl=600)
-        backend = StreamBackend(lambda: real_async_redis)
+        backend = StreamBackend(
+            lambda: real_async_redis,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         writer = await backend.open(scope=scope, stream_id="r1")
         await writer.append("delta", {})
@@ -892,7 +899,10 @@ class TestBackend:
         scope: str,
     ) -> None:
         settings_env()
-        backend = StreamBackend(lambda: real_async_redis)
+        backend = StreamBackend(
+            lambda: real_async_redis,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         writer = await backend.open(scope=scope, stream_id="r1")
         await writer.append("delta", {})
@@ -921,7 +931,10 @@ class TestBackend:
         scope: str,
     ) -> None:
         settings_env(stream_maxlen=10)
-        backend = StreamBackend(lambda: real_async_redis)
+        backend = StreamBackend(
+            lambda: real_async_redis,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         writer = await backend.open(scope=scope, stream_id="r1")
         first = await writer.append("delta", {"n": 0})
@@ -940,7 +953,10 @@ class TestBackend:
         scope: str,
     ) -> None:
         settings_env(stream_replay_page=2)
-        backend = StreamBackend(lambda: real_async_redis)
+        backend = StreamBackend(
+            lambda: real_async_redis,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         writer = await backend.open(scope=scope, stream_id="r1")
         for n in range(6):
@@ -1022,7 +1038,10 @@ class TestBackend:
         # TestClient runs a streaming response to its end before returning,
         # so two readers cannot overlap through it; drive ASGI directly.
         settings_env(stream_max_readers=1)
-        backend = StreamBackend(lambda: real_async_redis)
+        backend = StreamBackend(
+            lambda: real_async_redis,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         await backend.open(scope=scope, stream_id="r1")
         request = _get()
@@ -1157,7 +1176,10 @@ class TestBackend:
         scope: str,
     ) -> None:
         settings_env(stream_replay_page=2)
-        backend = StreamBackend(lambda: real_async_redis)
+        backend = StreamBackend(
+            lambda: real_async_redis,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         writer = await backend.open(scope=scope, stream_id="r1")
         first = await writer.append("delta", {"i": 0})

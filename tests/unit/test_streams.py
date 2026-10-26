@@ -33,6 +33,7 @@ from redis_fastapi import (
     StreamEvent,
     StreamInvalidCursor,
     StreamInvalidName,
+    StreamSettings,
     StreamUnsupported,
     add_redis_streams,
     get_stream_backend,
@@ -211,7 +212,7 @@ class TestNames:
 
     def test_keys_use_the_prefix_setting(self, settings_env: Any) -> None:
         settings_env(prefix="myapp")
-        keys = _keys("chat:1", "r")
+        keys = _keys("chat:1", "r", prefix="myapp")
         assert keys.stream == "myapp:stream:{chat:1}:r"
         assert keys.meta == "myapp:stream-meta:{chat:1}:r"
         assert keys.active == "myapp:stream-active:{chat:1}"
@@ -597,7 +598,10 @@ class TestUnsupported:
     @pytest.fixture()
     def backend(self, settings_env: Any) -> StreamBackend:
         settings_env()
-        backend = StreamBackend(lambda: MagicMock())
+        backend = StreamBackend(
+            lambda: MagicMock(),
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=False))
         return backend
 
@@ -621,7 +625,10 @@ class TestUnsupported:
         settings_env()
         client = MagicMock()
         client.execute_command = AsyncMock(return_value=[None, [1]])
-        backend = StreamBackend(lambda: client)
+        backend = StreamBackend(
+            lambda: client,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         assert await backend.detect() is False
         assert await backend.detect() is False
         assert client.execute_command.await_count == 1
@@ -633,7 +640,10 @@ class TestUnsupported:
         client.execute_command = AsyncMock(
             side_effect=[RedisConnectionError(), [[1], [1]]]
         )
-        backend = StreamBackend(lambda: client)
+        backend = StreamBackend(
+            lambda: client,
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         assert await backend.detect() is None
         assert await backend.detect() is True
 
@@ -649,7 +659,10 @@ class TestUnsupported:
 class TestWriterValidation:
     async def test_invalid_names_fail_before_redis(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(lambda: MagicMock())
+        backend = StreamBackend(
+            lambda: MagicMock(),
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         with pytest.raises(StreamInvalidName):
             await backend.open(scope="bad scope")
@@ -662,7 +675,10 @@ class TestWriterValidation:
         self, settings_env: Any
     ) -> None:
         settings_env()
-        backend = StreamBackend(lambda: MagicMock())
+        backend = StreamBackend(
+            lambda: MagicMock(),
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         backend._start(_StreamCapabilities(supported=True))
         with pytest.raises(StreamInvalidName):
             await backend.cancel("../x", scope="chat:1")
@@ -673,13 +689,22 @@ class TestWriterValidation:
 
     def test_oversized_event(self, settings_env: Any) -> None:
         settings_env(stream_max_event_bytes=10)
-        backend = StreamBackend(lambda: MagicMock())
+        backend = StreamBackend(
+            lambda: MagicMock(),
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         with pytest.raises(ValueError, match="stream_max_event_bytes"):
             backend._encode({"text": "a long payload"})
 
     def test_undecodable_payload_passes_as_text(self, settings_env: Any) -> None:
         settings_env()
-        assert StreamBackend(lambda: MagicMock())._decode(b"not json") == "not json"
+        assert (
+            StreamBackend(
+                lambda: MagicMock(),
+                settings=StreamSettings.from_redis_settings(get_settings()),
+            )._decode(b"not json")
+            == "not json"
+        )
 
 
 class TestDurations:
@@ -716,14 +741,20 @@ class TestSpawnGuards:
 
     async def test_a_retry_handle_is_refused(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(lambda: MagicMock())
+        backend = StreamBackend(
+            lambda: MagicMock(),
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         with pytest.raises(ValueError, match="created"):
             backend.spawn(self._writer(backend, created=False), _noop)
         assert not backend._spawned
 
     async def test_a_writer_is_spawned_once(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(lambda: MagicMock())
+        backend = StreamBackend(
+            lambda: MagicMock(),
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         writer = self._writer(backend, created=True)
         writer._task = asyncio.get_running_loop().create_future()  # type: ignore[assignment]
         with pytest.raises(ValueError, match="already runs"):
@@ -731,7 +762,10 @@ class TestSpawnGuards:
 
     async def test_a_retry_handle_cannot_extend(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(lambda: MagicMock())
+        backend = StreamBackend(
+            lambda: MagicMock(),
+            settings=StreamSettings.from_redis_settings(get_settings()),
+        )
         with pytest.raises(StreamFenced):
             await self._writer(backend, created=False).extend(60)
 
@@ -836,7 +870,10 @@ class _Client:
 
 
 def _started_backend(client: _Client) -> StreamBackend:
-    backend = StreamBackend(lambda: client)
+    backend = StreamBackend(
+        lambda: client,
+        settings=StreamSettings.from_redis_settings(get_settings()),
+    )
     backend._start(_StreamCapabilities(supported=True))
     return backend
 
@@ -873,7 +910,11 @@ def _lost_plan() -> Any:
     from redis_fastapi.stream_backend import _ReadPlan
 
     return _ReadPlan(
-        keys=_keys("chat:1", "r1"), stream_id="r1", cursor=(0, 0), last_seq=1
+        keys=_keys("chat:1", "r1"),
+        stream_id="r1",
+        cursor=(0, 0),
+        last_seq=1,
+        generation=1,  # a backend after its first _start()
     )
 
 

@@ -21,6 +21,7 @@ import logging
 import secrets
 import time
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +42,7 @@ from redis_fastapi.stream_backend import (
     _Entry,
     parse_cursor,
 )
+from redis_fastapi.stream_settings import StreamSettings
 from redis_fastapi.telemetry import record_stream_operation
 from redis_fastapi.types import Coder
 
@@ -240,7 +242,7 @@ async def sse(
     """
     await backend._require_support()
     cursor = select_cursor(request, after)
-    settings = get_settings()
+    settings = backend.settings
 
     credential_left: float | None = None
     if expires_at is not None:
@@ -316,60 +318,77 @@ async def stream_error_handler(request: Request, exc: Exception) -> Response:
     )
 
 
-def check_stream_settings() -> None:
-    """Reject settings the feature cannot work with.
-
-    Checked when the feature is enabled, not by ``RedisSettings`` itself, so
-    an application that does not use streams is never affected.
-
-    Raises:
-        StreamConfigurationError: If a setting cannot work.
-    """
+def check_stream_settings() -> StreamSettings:
+    """Resolve and validate the fluent environment adapter's stream settings."""
     settings = get_settings()
-    if "{" in settings.prefix or "}" in settings.prefix:
+    policy = StreamSettings.from_redis_settings(settings)
+    if (
+        settings.socket_timeout is not None
+        and settings.socket_timeout <= policy.stream_heartbeat_interval
+    ):
         raise StreamConfigurationError(
-            "The key prefix must not contain '{' or '}': Redis hashes on the "
-            "first braces in a key, which would put every stream in one slot."
+            "socket_timeout must be longer than stream_heartbeat_interval"
         )
-    block = settings.stream_heartbeat_interval
-    if settings.stream_alive_ttl <= block:
-        raise StreamConfigurationError(
-            "stream_alive_ttl must be longer than "
-            "stream_heartbeat_interval, or a live producer looks dead."
-        )
-    if settings.socket_timeout is not None and settings.socket_timeout <= block:
-        raise StreamConfigurationError(
-            "socket_timeout must be longer than stream_heartbeat_interval, which "
-            "bounds each blocking stream read."
-        )
+    return policy
 
 
 def add_redis_streams(
     app: FastAPI,
     *,
+    backend: StreamBackend | None = None,
+    manage_lifespan: bool = True,
     coder: type[Coder] | None = None,
 ) -> StreamBackend:
-    """Enable resumable streams on *app*.
+    """Register streaming dependencies and errors for this app.
 
-    Creates the application's one :class:`StreamBackend`, registers the
-    handler that turns stream errors into status codes, and marks the app so
-    the lifespan detects server support at startup and stops spawned
-    producers at shutdown.  Calling it twice returns the same backend.
-
-    Raises:
-        StreamConfigurationError: If a setting cannot work.
+    Injected backends use only their explicit clients and settings. By default
+    registration wraps the existing lifespan to start and stop the backend.
+    With manage_lifespan=False the application owns backend entry/exit too.
+    Supplied Redis clients are never closed. Without a backend, the existing
+    environment-managed redis_lifespan setup is preserved.
     """
+    injected = backend is not None
+    if injected and coder is not None:
+        raise StreamConfigurationError("configure coder on the injected backend")
+    if not injected and not manage_lifespan:
+        raise StreamConfigurationError(
+            "manage_lifespan=False requires an injected backend"
+        )
     existing: StreamBackend | None = getattr(app.state, "_redis_streams", None)
     if existing is not None:
+        if (
+            app.state._redis_streams_injected != injected
+            or app.state._redis_streams_manage_lifespan != manage_lifespan
+            or (injected and existing is not backend)
+            or (coder is not None and existing._coder is not coder)
+        ):
+            raise StreamConfigurationError("conflicting stream registration")
         return existing
-    check_stream_settings()
 
-    from redis_fastapi.deps import _get_pool_state
+    if backend is None:
+        settings = check_stream_settings()
+        from redis_fastapi.deps import _get_pool_state
 
-    backend = StreamBackend(
-        lambda: _get_pool_state(app).get_async_client(), coder=coder
-    )
+        backend = StreamBackend(
+            lambda: _get_pool_state(app).get_async_client(),
+            settings=settings,
+            coder=coder,
+        )
+    elif manage_lifespan:
+        original = app.router.lifespan_context
+        owned_backend = backend
+
+        @asynccontextmanager
+        async def lifespan(app: FastAPI) -> AsyncIterator[Any]:
+            async with owned_backend:
+                async with original(app) as state:
+                    yield state
+
+        app.router.lifespan_context = lifespan
+
     app.state._redis_streams = backend
+    app.state._redis_streams_injected = injected
+    app.state._redis_streams_manage_lifespan = manage_lifespan
     # One handler for the whole family.  Starlette picks the most specific
     # class, so an application's handler for a subclass still wins, and one
     # the application already set for StreamError is left in place.
