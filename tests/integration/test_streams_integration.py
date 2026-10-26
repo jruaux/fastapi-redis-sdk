@@ -373,12 +373,18 @@ class TestHttp:
 
         with TestClient(_app(forever)) as client:
             client.post(f"/{scope}/runs/r1")
-            time.sleep(0.1)
+            deadline = time.monotonic() + 2
+            while not real_redis.exists(_keys(scope, "r1").stream):
+                assert time.monotonic() < deadline, "producer never appended"
+                time.sleep(0.01)
             assert client.post(f"/{scope}/runs/r1/cancel").json() == {"cancelled": True}
             _, frames = _read(client, f"/{scope}/runs/r1/events")
             assert frames[-1]["event"] == "stream.end"
             assert frames[-1]["data"] == {"reason": "cancelled"}
-            assert client.get(f"/{scope}/active").json() == {"stream_id": None}
+            deadline = time.monotonic() + 2
+            while client.get(f"/{scope}/active").json() != {"stream_id": None}:
+                assert time.monotonic() < deadline, "active slot was not released"
+                time.sleep(0.01)
             assert client.post(f"/{scope}/runs/r1/cancel").json() == {
                 "cancelled": False
             }
@@ -526,8 +532,10 @@ class TestBackend:
         ids = await asyncio.gather(
             other.finish("message", {"by": "other"}),
             writer._end("stream.end", {"reason": "done"}),
+            return_exceptions=True,
         )
-        assert ids[0] == ids[1]
+        assert isinstance(ids[0], str)
+        assert isinstance(ids[1], StreamFenced)
         entries = await real_async_redis.xrange(_keys(scope, "r1").stream)
         assert sum(1 for _, fields in entries if fields.get("f") == "1") == 1
 
@@ -538,14 +546,16 @@ class TestBackend:
         await old.append("delta", {"n": 1})
         new = await backend.attach("r1", scope=scope)
         with pytest.raises(StreamFenced):
-            await old.append("delta", {"n": 2})  # this one lands, then fences
+            await old.append(
+                "delta", {"n": 2}
+            )  # rejected before the transaction writes
         with pytest.raises(StreamFenced):
             await old.append("delta", {"n": 3})  # refused locally
         await new.append("delta", {"n": 4})
         entries = await real_async_redis.xrange(_keys(scope, "r1").stream)
-        assert [json.loads(f["d"])["n"] for _, f in entries] == [1, 2, 4]
+        assert [json.loads(f["d"])["n"] for _, f in entries] == [1, 4]
         # The new writer continues the sequence numbers without a hole.
-        assert [int(f["q"]) for _, f in entries] == [1, 2, 2]
+        assert [int(f["q"]) for _, f in entries] == [1, 2]
 
     async def test_attach_rejects_unknown_and_finished(
         self, backend: StreamBackend, scope: str

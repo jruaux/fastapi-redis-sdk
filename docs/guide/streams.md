@@ -138,8 +138,11 @@ reconnect after it gets `204`, which stops `EventSource` for good.
   reports that code instead.
 
 After the final event the writer refuses further appends with
-`StreamFinished`. Every final event shares one idempotency key, so a stream
-holds at most one, even if two writers end it at the same time.
+`StreamFinished`. The final event and terminal metadata commit together. Ownership and terminal
+status are checked with same-slot WATCH/MULTI/EXEC before writing; native IDMP
+also protects ambiguous retries. A superseded writer cannot append or finish.
+Readers derive the final cursor from the committed log even before its optional
+metadata mirror is updated.
 
 ---
 
@@ -264,8 +267,7 @@ reader then stops, and reconnects get `204` instead of waiting again.
   the active slot, for a run that waits on something slow.
 - **Another process continues.** `streams.attach(stream_id, scope=...)`
   returns a writer that continues the run's sequence numbers. The old writer is
-  fenced: its next append or heartbeat raises `StreamFenced`, and at most that
-  one append lands after the takeover.
+  fenced: its next append or heartbeat raises `StreamFenced`, and no append from the old writer commits after the takeover.
 
 A reader that cannot write, because its Redis ACL is read-only, sends a
 `stream.error` event with code `producer_lost` and closes instead.
@@ -426,3 +428,29 @@ With [telemetry](observability.md) enabled, the feature emits
 `redis_fastapi.streams.operations` (by operation and result),
 `redis_fastapi.streams.latency` and the `redis_fastapi.streams.readers` gauge.
 No scope, stream ID or event data becomes a label.
+
+## Concurrent creation and ownership
+
+Concurrent `open()` calls for the same scope/ID have one atomic metadata claim.
+Only the winner receives `created=True`; other calls receive a read-only handle
+with `created=False`. Keep the `if writer.created: streams.spawn(...)` check.
+An uncertain creation reply is retried with the same claim identity. An orphaned
+payload without metadata is rejected rather than overwritten.
+
+Append, completion, takeover, heartbeat, suspension, cancellation and lost-producer
+sealing use bounded same-slot WATCH/MULTI/EXEC guards. A stale writer is rejected
+before writing an entry, extending its keys, or sealing the stream. Concurrent
+appends through one writer are serialized so their sequence/IDMP identities are
+distinct. Reads and Redis persistence guarantees are unchanged; deduplication
+still depends on the server's bounded IDMP window.
+
+The scope-wide active slot remains a separate-slot admission mechanism. Its
+acquisition and release cannot be part of the run's metadata transaction; failures
+can leave admission temporarily busy until the slot TTL expires. This change does
+not migrate keys or make external agent effects transactional. A running producer
+must cooperate with cancellation; Redis fencing cannot undo tool calls.
+
+The new real-Redis regression cases are in `test_stream_ownership.py`.
+`STREAMS_TEST_CLUSTER_URL` and `STREAMS_TEST_ENTERPRISE_URL` opt into explicitly
+supplied test endpoints. Missing topologies are reported as skipped, and teardown
+removes only each test's random `stream-regression:` namespace.
