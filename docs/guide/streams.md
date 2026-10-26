@@ -104,7 +104,7 @@ may use letters, digits and `_ -`, up to 64.
 ### Producing
 
 `spawn()` runs your producer as a task the backend owns. It keeps a reference
-so the task is not garbage-collected, refreshes the producer heartbeat while
+so the task is not garbage-collected, refreshes retained history, metadata and the producer heartbeat while
 it runs, and cancels it at shutdown.
 
 ```python
@@ -426,3 +426,24 @@ With [telemetry](observability.md) enabled, the feature emits
 `redis_fastapi.streams.operations` (by operation and result),
 `redis_fastapi.streams.latency` and the `redis_fastapi.streams.readers` gauge.
 No scope, stream ID or event data becomes a label.
+
+## Retention during quiet producers
+
+`spawn()` runs `keepalive()` around the producer. Each successful heartbeat now
+renews the stream payload and metadata as well as liveness, so a live producer
+waiting on a long tool call does not lose earlier output after `stream_ttl_active`.
+This is sliding retention while the producer is alive; it is not execution
+recovery after process loss.
+
+Renewal verifies current ownership and running state using same-slot
+WATCH/MULTI/EXEC. It refuses to recreate missing history or metadata and cannot
+extend terminal retention. `suspend(ttl)` uses the same guard. Heartbeats and
+active-slot refreshes preserve any longer suspension deadline instead of
+shortening it back to the normal active TTL. Stop keepalive when producer work
+ends; otherwise a live process can keep its active run retained.
+
+The new real-Redis regression cases are in `test_stream_heartbeat.py`.
+`STREAMS_TEST_CLUSTER_URL` and `STREAMS_TEST_ENTERPRISE_URL` opt into explicitly
+supplied test endpoints. Missing topologies are reported as skipped, and teardown
+removes only each test's random `stream-regression:` namespace. General writer
+and lost-producer fencing are addressed separately; this change guards renewal.

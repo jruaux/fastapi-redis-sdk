@@ -373,12 +373,18 @@ class TestHttp:
 
         with TestClient(_app(forever)) as client:
             client.post(f"/{scope}/runs/r1")
-            time.sleep(0.1)
+            deadline = time.monotonic() + 2
+            while not real_redis.exists(_keys(scope, "r1").stream):
+                assert time.monotonic() < deadline, "producer never appended"
+                time.sleep(0.01)
             assert client.post(f"/{scope}/runs/r1/cancel").json() == {"cancelled": True}
             _, frames = _read(client, f"/{scope}/runs/r1/events")
             assert frames[-1]["event"] == "stream.end"
             assert frames[-1]["data"] == {"reason": "cancelled"}
-            assert client.get(f"/{scope}/active").json() == {"stream_id": None}
+            deadline = time.monotonic() + 2
+            while client.get(f"/{scope}/active").json() != {"stream_id": None}:
+                assert time.monotonic() < deadline, "active slot was not released"
+                time.sleep(0.01)
             assert client.post(f"/{scope}/runs/r1/cancel").json() == {
                 "cancelled": False
             }

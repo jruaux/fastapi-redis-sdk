@@ -40,7 +40,12 @@ from typing import TYPE_CHECKING, Any, TypeAlias
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.cluster import RedisCluster as AsyncRedisCluster
 from redis.exceptions import ConnectionError as RedisConnectionError
-from redis.exceptions import NoPermissionError, RedisClusterException, RedisError
+from redis.exceptions import (
+    NoPermissionError,
+    RedisClusterException,
+    RedisError,
+    WatchError,
+)
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from redis_fastapi.config import get_settings
@@ -469,20 +474,62 @@ class StreamWriter:
         continue with :meth:`StreamBackend.attach`.
         """
         seconds = _seconds(ttl)
-        window = get_settings().stream_expiry_window
-        client = self._backend._client()
-        try:
-            pipe = client.pipeline(transaction=True)
-            pipe.expire(self._keys.stream, seconds)
-            pipe.expire(self._keys.meta, seconds + window)
-            pipe.set(self._keys.alive, 1, ex=seconds)
-            await pipe.execute()
-            if self._exclusive:
-                await self._backend._refresh_slot(
-                    self._keys.active, self.stream_id, seconds
-                )
-        except STORE_ERRORS as exc:
-            raise StreamStoreError("could not suspend the stream") from exc
+        await self._renew(seconds * 1000, seconds * 1000)
+        if self._exclusive:
+            await self._backend._refresh_slot(
+                self._keys.active, self.stream_id, seconds
+            )
+
+    async def _renew(self, ttl_ms: int, alive_ms: int) -> bool:
+        """Renew current producer state without reviving expired history.
+
+        Never shorten a longer explicit suspension, and never extend terminal
+        retention. WATCH covers ownership, completion and expiry before mutation.
+        """
+        settings = get_settings()
+        for attempt in range(_WRITE_ATTEMPTS):
+            try:
+                async with self._backend._client().pipeline(transaction=True) as pipe:
+                    await pipe.watch(
+                        self._keys.meta, self._keys.stream, self._keys.alive
+                    )
+                    raw = await pipe.hgetall(self._keys.meta)
+                    meta = {_text(k): _text(v) for k, v in raw.items()}
+                    if not meta:
+                        raise StreamExpired(f"stream {self.stream_id} has expired")
+                    if meta.get(M_WRITER) != self._writer_id:
+                        self._fenced = True
+                        raise StreamFenced(
+                            f"stream {self.stream_id} was handed to another writer"
+                        )
+                    if meta.get(M_STATUS) == STATUS_FINISHED:
+                        raise StreamFinished(f"stream {self.stream_id} already ended")
+                    stream_left = await pipe.pttl(self._keys.stream)
+                    if meta.get(M_STARTED) == "1" and stream_left == -2:
+                        raise StreamExpired(f"stream {self.stream_id} has expired")
+                    meta_left = await pipe.pttl(self._keys.meta)
+                    alive_left = await pipe.pttl(self._keys.alive)
+                    stream_ttl = max(ttl_ms, stream_left)
+                    pipe.multi()  # type: ignore[no-untyped-call]
+                    if stream_left != -2:
+                        pipe.pexpire(self._keys.stream, stream_ttl)
+                    pipe.pexpire(
+                        self._keys.meta,
+                        max(
+                            meta_left, stream_ttl + settings.stream_expiry_window * 1000
+                        ),
+                    )
+                    pipe.set(self._keys.alive, 1, px=max(alive_ms, alive_left))
+                    await pipe.execute()
+                    return meta.get(M_CANCEL) == "1"
+            except WatchError:
+                if attempt == _WRITE_ATTEMPTS - 1:
+                    raise StreamStoreError(
+                        "stream changed during every heartbeat attempt"
+                    ) from None
+            except STORE_ERRORS as exc:
+                raise StreamStoreError("could not renew the stream") from exc
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def keepalive(self) -> AbstractAsyncContextManager[None]:
         """Refresh the producer heartbeat while a block runs.
@@ -508,33 +555,25 @@ class StreamWriter:
         settings = get_settings()
         while True:
             await asyncio.sleep(settings.stream_heartbeat_seconds)
-            client = self._backend._client()
             try:
-                pipe = client.pipeline(transaction=True)
-                pipe.set(
-                    self._keys.alive,
-                    1,
-                    px=int(settings.stream_alive_ttl_seconds * 1000),
+                cancelled = await self._renew(
+                    settings.stream_ttl_active * 1000,
+                    int(settings.stream_alive_ttl_seconds * 1000),
                 )
-                pipe.hmget(self._keys.meta, [M_CANCEL, M_WRITER])
-                replies = await pipe.execute()
                 if self._exclusive:
                     await self._backend._refresh_slot(
-                        self._keys.active,
-                        self.stream_id,
-                        settings.stream_ttl_active,
+                        self._keys.active, self.stream_id, settings.stream_ttl_active
                     )
-            except STORE_ERRORS:
-                logger.debug("Stream heartbeat failed; will retry", exc_info=True)
-                continue
-            cancel, writer = (_text(v) for v in replies[-1])
-            if writer is not None and writer != self._writer_id:
-                logger.info("Stream %s was handed to another writer", self.stream_id)
-                self._fenced = True
+            except StreamFinished:
+                return  # finish() may still be completing the producer's cleanup
+            except (StreamFenced, StreamExpired):
                 if self._task is not None:
                     self._task.cancel()
                 return
-            if cancel == "1":
+            except StreamStoreError:
+                logger.debug("Stream heartbeat failed; will retry", exc_info=True)
+                continue
+            if cancelled:
                 self._cancelled = True
                 if self._task is not None:
                     self._task.cancel()
@@ -761,10 +800,25 @@ class StreamBackend:
         await pipe.execute()
 
     async def _refresh_slot(self, active: str, stream_id: str, ttl: int) -> None:
-        """Extend the active slot only while it still names *stream_id*."""
-        await self._client().execute_command(
-            "SET", active, stream_id, "IFEQ", stream_id, "EX", ttl
-        )
+        """Extend an owned slot without shortening an explicit suspension."""
+        for attempt in range(_WRITE_ATTEMPTS):
+            try:
+                async with self._client().pipeline(transaction=True) as pipe:
+                    await pipe.watch(active)
+                    if _text(await pipe.get(active)) != stream_id:
+                        return
+                    remaining = await pipe.pttl(active)
+                    pipe.multi()  # type: ignore[no-untyped-call]
+                    pipe.pexpire(active, max(ttl * 1000, remaining))
+                    await pipe.execute()
+                    return
+            except WatchError:
+                if attempt == _WRITE_ATTEMPTS - 1:
+                    raise StreamStoreError(
+                        "active slot changed during every renewal attempt"
+                    ) from None
+            except STORE_ERRORS as exc:
+                raise StreamStoreError("could not renew the active slot") from exc
 
     async def _release_slot(self, active: str, stream_id: str) -> None:
         """Free the active slot only if it still names *stream_id*.
