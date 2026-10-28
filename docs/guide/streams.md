@@ -76,29 +76,27 @@ The check confirms the command set, not the patch release. Redis 8.6.0 and
 
 ---
 
-## Explicit clients and configuration (including Redis Iris)
+## Your own clients and options
 
-Use an injected backend when your application or a higher-level SDK owns Redis
-configuration. `StreamSettings` reads no environment variables or `.env` files:
+An application, or an SDK built on this one such as Redis Iris, may own its
+Redis clients and configuration. Build the backend on those clients and
+register it:
 
 ```python
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 from redis.asyncio import Redis
-from redis_fastapi import (
-    StreamBackend, StreamBackendDep, StreamSettings, add_redis_streams,
-)
+from redis_fastapi import FastAPIRedis, StreamBackend, StreamBackendDep
 
-# Resolve this URL in your application. Configure credentials, TLS and pooling
-# with redis-py. Both clients must point to the same database and use primary reads.
 redis_url = "redis://localhost:6379/0"
 commands = Redis.from_url(redis_url, max_connections=16, socket_timeout=30)
 readers = Redis.from_url(redis_url, max_connections=256, socket_timeout=30)
 streams = StreamBackend(
     commands,
     blocking_client=readers,
-    settings=StreamSettings(prefix="myapp:sse"),
+    key_prefix="myapp:sse",
+    max_readers=256,
 )
 
 
@@ -113,7 +111,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
-add_redis_streams(app, backend=streams, manage_lifespan=False)
+FastAPIRedis(app).streams(backend=streams)
 
 
 @app.get("/chats/{chat_id}/runs/{stream_id}/events",
@@ -123,53 +121,34 @@ async def events(chat_id: str, stream_id: str, request: Request,
     return await backend.sse(stream_id, request=request, scope=f"chat:{chat_id}")
 ```
 
-`require_chat_access` is your application's authentication and authorization
-check, as in the first example. Build the scope from the authorized resource.
-The injected path does not create SDK pools or start/stop global telemetry.
-Existing explicitly enabled telemetry still observes streaming operations.
+`require_chat_access` is your access check, as in the first example.
 
-`manage_lifespan=False` leaves backend entry and exit to your lifespan. By
-default, `add_redis_streams(app, backend=streams)` wraps the app's existing
-lifespan and owns backend startup/shutdown. In that mode supplied clients must
-already be usable before the original lifespan starts, and remain usable until
-backend shutdown completes. Neither mode closes external clients. A backend
-permits one lifecycle owner at a time. Identical registrations are no-ops;
-conflicting backends, lifecycle modes, or mixed environment/injected registration
-raise `StreamConfigurationError`.
+**Clients.** `StreamBackend` takes an async redis-py `Redis` or `RedisCluster`
+client, or a callable that returns one. It never closes a client it was
+given. `blocking_client` is optional. Without it, the blocking reads share
+`client`'s pool, as with `.streams()`. A blocking client must not share
+`client`'s pool, and its `socket_timeout` must be longer than
+`heartbeat_interval`; the backend refuses to start otherwise. Both clients
+must reach the same database.
 
-`FastAPIRedis(app).streams(backend=streams, manage_lifespan=False)` is equivalent.
-Do not add `.lifespan()` merely to register an injected backend: that explicitly
-opts into the SDK's separate environment-managed connection and telemetry setup.
+**Options.** Each option overrides the setting of the same name with a
+`stream_` prefix: `max_readers` overrides `stream_max_readers`, and
+`key_prefix` overrides `prefix`. Durations are whole seconds or a
+`timedelta`. The backend reads the settings once, when it is built, and only
+for the options you leave out. Give every option and it reads no `REDIS_*`
+variable at all. The same options work without a backend of your own:
+`.streams(key_prefix="myapp:sse")`.
 
-The constructor accepts async redis-py `Redis` or `RedisCluster` clients, and
-retains the existing callable-returning-client form. `blocking_client` is
-optional: without it blocking reads share the command pool, as in the fluent
-setup. When supplied, it must have independent connection resources. Two clients
-sharing the same exposed pool are rejected. The caller must ensure independent
-per-node pools for Cluster/custom clients and matching endpoints, credentials,
-and topology; the SDK cannot prove those properties for arbitrary clients.
-The reader socket timeout must exceed `stream_heartbeat_interval`.
+**Starting and stopping.** Use the backend as an async context manager:
+`async with streams` checks the server's support at the start and stops
+spawned producers and live readers at the end. If the app uses `.lifespan()`,
+that lifespan does it for you, so don't also enter the backend yourself. A
+worker without FastAPI can use `async with streams` the same way.
 
-A worker can use `async with streams` without FastAPI, or call
-`await streams.initialize()` and `await streams.aclose()` in its own lifecycle.
-Backend shutdown cancels its spawned producers and signals readers to finish at
-their next bounded read; it does not close application clients. Initialization
-preserves the existing best-effort capability detection and unsupported-server
-behavior described above.
-
-`StreamSettings` is immutable. Every backend, writer, key builder and SSE response
-uses that backend's policy; separate apps can have different prefixes and limits.
-To adapt an already resolved `RedisSettings`, use
-`StreamSettings.from_redis_settings(settings)`. Only stream policy fields are
-copied; connection and telemetry settings stay with their owners. Direct backend
-construction defaults to `StreamSettings()`. Callers of the older factory
-constructor who relied on global settings must now pass that adapter explicitly.
-The existing `FastAPIRedis(app).lifespan().streams()` path resolves it automatically.
-
-Iris can re-export `StreamBackend`, `StreamSettings`, `StreamBackendDep`,
-`get_stream_backend`, `add_redis_streams`, `StreamWriter`, `StreamEvent`, and the
-public stream error hierarchy. There is no Iris dependency in this package.
-Storage keys, producer semantics, cursor rules and retention behavior are unchanged.
+**Two apps.** Each app has its own backend, so two apps in one process can
+use different prefixes and limits. Registering a second, different backend on
+one app raises `StreamConfigurationError`, as does passing options alongside
+a backend. Pass them to the backend instead.
 
 ---
 
@@ -753,7 +732,8 @@ events.addEventListener("stream.error", (e) => {
   closes the response, so a frozen tab does not hold a slot. A dead client on
   an idle stream is not caught this way; the connection cap bounds that case.
 - **Connections.** Each live reader holds a pool connection for each blocking
-  read. An injected backend can use a separate `blocking_client` pool. With `REDIS_MAX_CONNECTIONS` set, size it for `stream_max_readers` plus
+  read, or a `blocking_client` connection if the backend has one. With
+  `REDIS_MAX_CONNECTIONS` set, size the pool for `stream_max_readers` plus
   your other traffic. The driver's `socket_timeout` must be longer than
   `stream_heartbeat_interval`; `.streams()` refuses a setup where it is not.
 - **Redis failover.** Replication is asynchronous, so a failover can lose
@@ -766,9 +746,9 @@ events.addEventListener("stream.error", (e) => {
 
 ## Limitations
 
-- **Shared storage policy.** Independent workers and API backends must agree
-  on the database and every setting shaping stored data: prefix, TTLs, expiry
-  window, maximum length and event size. The key layout is internal.
+- **Shared storage settings.** Every backend that reads or writes the same
+  streams, in a worker or an API process, must use the same database, prefix,
+  TTLs, `maxlen` and `max_event_bytes`. The key layout is internal.
 - **Producers do not survive a deploy.** A producer started by `spawn()` dies
   with its process. Its readers get `producer_lost`, and the user starts a new
   run.
@@ -807,7 +787,9 @@ must not contain braces.
 Every setting is an environment variable prefixed `REDIS_`, so
 `stream_active_ttl` is `REDIS_STREAM_ACTIVE_TTL`. Durations are whole
 seconds, as everywhere else in the SDK. See
-[Configuration](configuration.md) for how these are loaded.
+[Configuration](configuration.md) for how these are loaded. A backend
+option overrides each one: drop the `stream_` prefix, so `max_readers`
+overrides `stream_max_readers`.
 
 | Setting                          | Default  | Notes                                                                |
 |----------------------------------|----------|----------------------------------------------------------------------|

@@ -175,8 +175,13 @@ async def _start_streams(app: FastAPI, ps: _PoolState) -> Any:
     warning; the application still starts.
     """
     backend = getattr(app.state, "_redis_streams", None)
-    if backend is None or getattr(app.state, "_redis_streams_injected", False):
+    if backend is None:
         return None
+    if getattr(app.state, "_redis_streams_injected", False):
+        # A backend on the application's own clients keeps its own support
+        # cache: its Redis may not be the pool's.
+        await backend._initialize()
+        return backend
     from redis_fastapi.stream_backend import _StreamCapabilities
 
     ps.stream_capabilities = _StreamCapabilities()

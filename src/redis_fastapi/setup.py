@@ -207,8 +207,8 @@ class FastAPIRedis:
         self,
         *,
         backend: StreamBackend | None = None,
-        manage_lifespan: bool = True,
         coder: type[Coder] | None = None,
+        **backend_options: Any,
     ) -> FastAPIRedis:
         """Enable resumable streams.
 
@@ -222,20 +222,19 @@ class FastAPIRedis:
         Calling this method more than once on the same app is a no-op.
 
         Args:
-            backend: Existing backend with explicit clients and policy. Without
-                one, use the environment-managed Redis lifespan.
-            manage_lifespan: Own the injected backend's startup/shutdown. False
-                leaves entry/exit to the caller. Supplied clients stay open.
-            coder: Serializer for an environment-managed backend.  Defaults to
+            backend: A ready-made backend, for an application that owns its
+                Redis clients.  ``.lifespan()``, if used, starts and stops it;
+                otherwise enter ``async with backend`` in your own lifespan.
+            coder: Serializer for event payloads.  Defaults to
                 :class:`~redis_fastapi.types.JsonableCoder`, JSON that also
-                takes Pydantic models, dataclasses and datetimes.  Configure
-                this on the backend itself when injecting one.
+                takes Pydantic models, dataclasses and datetimes.
+            **backend_options: Passed to :func:`add_redis_streams` -
+                ``key_prefix``, ``active_ttl``, ``heartbeat_interval`` and the
+                other :class:`~redis_fastapi.StreamBackend` options.
         """
         from redis_fastapi.streams import add_redis_streams
 
-        add_redis_streams(
-            self._app, backend=backend, manage_lifespan=manage_lifespan, coder=coder
-        )
+        add_redis_streams(self._app, backend=backend, coder=coder, **backend_options)
         return self
 
     def otel(self) -> FastAPIRedis:

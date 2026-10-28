@@ -21,7 +21,6 @@ import logging
 import secrets
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -42,7 +41,6 @@ from redis_fastapi.stream_backend import (
     _Entry,
     parse_cursor,
 )
-from redis_fastapi.stream_settings import StreamSettings
 from redis_fastapi.telemetry import record_stream_operation
 from redis_fastapi.types import Coder
 
@@ -242,7 +240,7 @@ async def sse(
     """
     await backend._require_support()
     cursor = select_cursor(request, after)
-    settings = backend.settings
+    settings = backend._policy
 
     credential_left: float | None = None
     if expires_at is not None:
@@ -318,77 +316,80 @@ async def stream_error_handler(request: Request, exc: Exception) -> Response:
     )
 
 
-def check_stream_settings() -> StreamSettings:
-    """Resolve and validate the fluent environment adapter's stream settings."""
-    settings = get_settings()
-    policy = StreamSettings.from_redis_settings(settings)
-    if (
-        settings.socket_timeout is not None
-        and settings.socket_timeout <= policy.stream_heartbeat_interval
-    ):
+def _check_socket_timeout(backend: StreamBackend) -> None:
+    """Reject a driver ``socket_timeout`` too short for the blocking reads.
+
+    Checked when the feature is enabled, not by ``RedisSettings`` itself, so
+    an application that does not use streams is never affected.  The other
+    checks run when the backend is built.
+
+    Raises:
+        StreamConfigurationError: If the timeout cannot work.
+    """
+    timeout = get_settings().socket_timeout
+    if timeout is not None and timeout <= backend._policy.stream_heartbeat_interval:
         raise StreamConfigurationError(
-            "socket_timeout must be longer than stream_heartbeat_interval"
+            "socket_timeout must be longer than stream_heartbeat_interval, which "
+            "bounds each blocking stream read."
         )
-    return policy
 
 
 def add_redis_streams(
     app: FastAPI,
     *,
     backend: StreamBackend | None = None,
-    manage_lifespan: bool = True,
     coder: type[Coder] | None = None,
+    **backend_options: Any,
 ) -> StreamBackend:
-    """Register streaming dependencies and errors for this app.
+    """Enable resumable streams on *app*.
 
-    Injected backends use only their explicit clients and settings. By default
-    registration wraps the existing lifespan to start and stop the backend.
-    With manage_lifespan=False the application owns backend entry/exit too.
-    Supplied Redis clients are never closed. Without a backend, the existing
-    environment-managed redis_lifespan setup is preserved.
+    Creates the application's one :class:`StreamBackend` on the SDK's
+    connection pool, or registers *backend*, one the application built on its
+    own clients.  Registers the handler that turns stream errors into status
+    codes, and marks the app so ``redis_lifespan`` starts the backend at
+    startup and stops it at shutdown.  An application that does not use
+    ``redis_lifespan`` enters ``async with backend`` in its own lifespan.
+    Calling it twice returns the same backend.
+
+    Args:
+        app: The FastAPI application.
+        backend: A ready-made backend, for an application that owns its Redis
+            clients.  The backend never closes them.
+        coder: Serializer for event payloads.  Defaults to
+            :class:`~redis_fastapi.types.JsonableCoder`.
+        **backend_options: Passed to :class:`StreamBackend` - ``key_prefix``,
+            ``active_ttl``, ``done_ttl``, ``gone_ttl``, ``maxlen``,
+            ``max_event_bytes``, ``heartbeat_interval``, ``alive_ttl``,
+            ``replay_page``, ``max_readers``, ``max_connection_duration``,
+            ``read_retry_window`` and ``send_timeout``.
+
+    Raises:
+        StreamConfigurationError: If a setting cannot work, if *backend* comes
+            with *coder* or options, or if the app already has another backend.
     """
-    injected = backend is not None
-    if injected and coder is not None:
-        raise StreamConfigurationError("configure coder on the injected backend")
-    if not injected and not manage_lifespan:
-        raise StreamConfigurationError(
-            "manage_lifespan=False requires an injected backend"
-        )
     existing: StreamBackend | None = getattr(app.state, "_redis_streams", None)
     if existing is not None:
-        if (
-            app.state._redis_streams_injected != injected
-            or app.state._redis_streams_manage_lifespan != manage_lifespan
-            or (injected and existing is not backend)
-            or (coder is not None and existing._coder is not coder)
-        ):
-            raise StreamConfigurationError("conflicting stream registration")
+        if backend is not None and backend is not existing:
+            raise StreamConfigurationError("this app already has a stream backend")
         return existing
-
-    if backend is None:
-        settings = check_stream_settings()
+    if backend is not None:
+        if coder is not None or backend_options:
+            raise StreamConfigurationError(
+                "pass coder and options to the StreamBackend you build, not "
+                "alongside it"
+            )
+        app.state._redis_streams_injected = True
+    else:
         from redis_fastapi.deps import _get_pool_state
 
         backend = StreamBackend(
             lambda: _get_pool_state(app).get_async_client(),
-            settings=settings,
             coder=coder,
+            **backend_options,
         )
-    elif manage_lifespan:
-        original = app.router.lifespan_context
-        owned_backend = backend
-
-        @asynccontextmanager
-        async def lifespan(app: FastAPI) -> AsyncIterator[Any]:
-            async with owned_backend:
-                async with original(app) as state:
-                    yield state
-
-        app.router.lifespan_context = lifespan
-
+        _check_socket_timeout(backend)
+        app.state._redis_streams_injected = False
     app.state._redis_streams = backend
-    app.state._redis_streams_injected = injected
-    app.state._redis_streams_manage_lifespan = manage_lifespan
     # One handler for the whole family.  Starlette picks the most specific
     # class, so an application's handler for a subclass still wins, and one
     # the application already set for StreamError is left in place.

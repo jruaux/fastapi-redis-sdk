@@ -94,7 +94,6 @@ from redis_fastapi.stream_backend import (
     StreamReader,
     StreamWriter,
 )
-from redis_fastapi.stream_settings import StreamSettings
 from redis_fastapi.streams import add_redis_streams, session_expiry
 from redis_fastapi.telemetry import disable_telemetry, enable_telemetry
 from redis_fastapi.types import (
@@ -167,7 +166,6 @@ __all__ = [
     "StreamInvalidName",
     "StreamNotFound",
     "StreamStoreError",
-    "StreamSettings",
     "StreamReader",
     "StreamUnsupported",
     "StreamWriter",

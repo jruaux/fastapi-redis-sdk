@@ -1,4 +1,4 @@
-"""Explicit clients, FastAPI replay and lifecycle against real Redis."""
+"""A backend on the application's own clients, against real Redis."""
 
 from __future__ import annotations
 
@@ -18,13 +18,32 @@ from redis_fastapi import (
     StreamBackend,
     StreamBackendDep,
     StreamConfigurationError,
-    StreamSettings,
     StreamWriter,
     add_redis_streams,
 )
 from redis_fastapi.config import get_settings
 from redis_fastapi.stream_backend import probe_streams_support
 from tests.conftest import REDIS_URL
+
+
+def _options(prefix: str, **overrides: object) -> dict[str, object]:
+    """Every backend option, so the backend reads no ``REDIS_*`` settings."""
+    return {
+        "key_prefix": prefix,
+        "active_ttl": 600,
+        "done_ttl": 120,
+        "gone_ttl": 3600,
+        "maxlen": 10_000,
+        "max_event_bytes": 65_536,
+        "heartbeat_interval": 1,
+        "alive_ttl": 3,
+        "replay_page": 100,
+        "max_readers": 256,
+        "max_connection_duration": 300,
+        "read_retry_window": 30,
+        "send_timeout": 10,
+        **overrides,
+    }
 
 
 @pytest.fixture(params=["standalone", "cluster", "enterprise"])
@@ -68,18 +87,13 @@ async def clients(request) -> AsyncIterator[tuple]:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("managed", [True, False])
-async def test_injected_http_and_lifecycle(clients, managed, monkeypatch):
+async def test_injected_http_and_lifecycle(clients, monkeypatch):
     commands, readers, prefix = clients
     monkeypatch.setenv("REDIS_URL", "invalid://ambient")
     monkeypatch.setenv("REDIS_STREAM_MAX_READERS", "invalid")
     monkeypatch.setenv("REDIS_PREFIX", "{invalid}")
     get_settings.cache_clear()
-    backend = StreamBackend(
-        commands,
-        blocking_client=readers,
-        settings=StreamSettings(prefix=prefix, stream_heartbeat_interval=1),
-    )
+    backend = StreamBackend(commands, blocking_client=readers, **_options(prefix))
     stopped = asyncio.Event()
     started = asyncio.Event()
     blocker = asyncio.Event()
@@ -93,14 +107,11 @@ async def test_injected_http_and_lifecycle(clients, managed, monkeypatch):
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        if managed:
+        async with backend:
             yield
-        else:
-            async with backend:
-                yield
 
     app = FastAPI(lifespan=lifespan)
-    add_redis_streams(app, backend=backend, manage_lifespan=managed)
+    add_redis_streams(app, backend=backend)
 
     @app.get("/events/{stream_id}")
     async def events(stream_id: str, request: Request, streams: StreamBackendDep):
@@ -150,30 +161,17 @@ async def test_two_apps_keep_policy_and_reads_separate(clients):
     first = StreamBackend(
         commands,
         blocking_client=readers,
-        settings=StreamSettings(
-            prefix=prefix + ":a",
-            stream_max_event_bytes=32,
-            stream_max_readers=1,
-            stream_heartbeat_interval=1,
-        ),
+        **_options(prefix + ":a", max_event_bytes=32, max_readers=1),
     )
     second = StreamBackend(
         commands,
         blocking_client=readers,
-        settings=StreamSettings(
-            prefix=prefix + ":b",
-            stream_max_event_bytes=1000,
-            stream_max_readers=2,
-            stream_heartbeat_interval=1,
-        ),
+        **_options(prefix + ":b", max_event_bytes=1000, max_readers=2),
     )
     apps = [FastAPI(), FastAPI()]
     for app, backend in zip(apps, [first, second], strict=True):
         FastAPIRedis(app).streams(backend=backend)
-    async with (
-        apps[0].router.lifespan_context(apps[0]),
-        apps[1].router.lifespan_context(apps[1]),
-    ):
+    async with first, second:
         a = await first.open(scope="chat:1", stream_id="same")
         b = await second.open(scope="chat:1", stream_id="same")
         with pytest.raises(ValueError, match="stream_max_event_bytes"):
@@ -202,13 +200,12 @@ async def test_two_apps_keep_policy_and_reads_separate(clients):
 @pytest.mark.integration
 async def test_failed_app_startup_leaves_external_clients_open(clients):
     commands, readers, prefix = clients
-    backend = StreamBackend(
-        commands, blocking_client=readers, settings=StreamSettings(prefix=prefix)
-    )
+    backend = StreamBackend(commands, blocking_client=readers, **_options(prefix))
 
     @asynccontextmanager
     async def broken(app: FastAPI):
-        raise RuntimeError("application startup failed")
+        async with backend:
+            raise RuntimeError("application startup failed")
         yield
 
     app = FastAPI(lifespan=broken)
@@ -219,8 +216,8 @@ async def test_failed_app_startup_leaves_external_clients_open(clients):
     assert not backend._running
     assert await commands.ping() and await readers.ping()
     async with backend:
-        with pytest.raises(StreamConfigurationError, match="owner"):
-            await backend.initialize()
+        with pytest.raises(StreamConfigurationError, match="already running"):
+            await backend._initialize()
 
 
 async def wait_for_xread(commands, prefix):
@@ -253,12 +250,8 @@ async def wait_for_xread(commands, prefix):
 @pytest.mark.integration
 async def test_restart_does_not_revive_blocked_readers(clients):
     commands, readers, prefix = clients
-    backend = StreamBackend(
-        commands,
-        blocking_client=readers,
-        settings=StreamSettings(prefix=prefix, stream_heartbeat_interval=1),
-    )
-    await backend.initialize()
+    backend = StreamBackend(commands, blocking_client=readers, **_options(prefix))
+    await backend._initialize()
     try:
         await backend.open(scope="chat:1", stream_id="live")
         async with await backend.follow("live", scope="chat:1") as events:
@@ -266,7 +259,7 @@ async def test_restart_does_not_revive_blocked_readers(clients):
             try:
                 await asyncio.wait_for(wait_for_xread(commands, prefix), 2)
                 await backend.aclose()
-                await backend.initialize()
+                await backend._initialize()
                 with pytest.raises(StopAsyncIteration):
                     await asyncio.wait_for(pending, 2)
             finally:
@@ -280,11 +273,7 @@ async def test_restart_does_not_revive_blocked_readers(clients):
 async def test_restart_during_gap_drops_old_buffered_event(clients):
     commands, readers, prefix = clients
     backend = StreamBackend(
-        commands,
-        blocking_client=readers,
-        settings=StreamSettings(
-            prefix=prefix, stream_replay_page=1, stream_heartbeat_interval=1
-        ),
+        commands, blocking_client=readers, **_options(prefix, replay_page=1)
     )
     async with backend:
         writer = await backend.open(scope="chat:1", stream_id="gap")
@@ -295,6 +284,25 @@ async def test_restart_during_gap_drops_old_buffered_event(clients):
             await commands.xdel(f"{prefix}:stream:{{chat:1}}:gap", *ids[1:3])
             assert (await anext(events)).type == "stream.gap"
             await backend.aclose()
-            await backend.initialize()
+            await backend._initialize()
             with pytest.raises(StopAsyncIteration):
                 await anext(events)
+
+
+@pytest.mark.integration
+async def test_redis_lifespan_runs_an_injected_backend(clients, monkeypatch):
+    commands, readers, prefix = clients
+    monkeypatch.setenv("REDIS_URL", REDIS_URL)
+    get_settings.cache_clear()
+    backend = StreamBackend(commands, blocking_client=readers, **_options(prefix))
+    app = FastAPI()
+    FastAPIRedis(app).lifespan().streams(backend=backend)
+    try:
+        async with app.router.lifespan_context(app):
+            assert backend._running and backend.supported is True
+            writer = await backend.open(scope="chat:1", stream_id="r1")
+            await writer.finish("message", {})
+        assert not backend._running
+        assert await commands.ping() and await readers.ping()
+    finally:
+        get_settings.cache_clear()

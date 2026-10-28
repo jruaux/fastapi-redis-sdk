@@ -33,7 +33,6 @@ from redis_fastapi import (
     StreamEvent,
     StreamInvalidCursor,
     StreamInvalidName,
-    StreamSettings,
     StreamUnsupported,
     add_redis_streams,
     get_stream_backend,
@@ -65,7 +64,6 @@ from redis_fastapi.stream_backend import (
 from redis_fastapi.streams import (
     _retry_ms,
     _SSEResponse,
-    check_stream_settings,
     encode_frame,
     select_cursor,
     stream_error_handler,
@@ -349,22 +347,28 @@ class TestProbe:
 class TestCheckStreamSettings:
     def test_defaults_pass(self, settings_env: Any) -> None:
         settings_env()
-        check_stream_settings()
+        add_redis_streams(FastAPI())
 
     def test_prefix_with_braces(self, settings_env: Any) -> None:
         settings_env(prefix="app:{x}")
         with pytest.raises(StreamConfigurationError, match="prefix"):
-            check_stream_settings()
+            add_redis_streams(FastAPI())
 
     def test_heartbeat_key_must_outlive_the_heartbeat(self, settings_env: Any) -> None:
         settings_env(stream_heartbeat_interval=10, stream_alive_ttl=10)
         with pytest.raises(StreamConfigurationError, match="alive"):
-            check_stream_settings()
+            add_redis_streams(FastAPI())
 
     def test_socket_timeout_must_exceed_the_block(self, settings_env: Any) -> None:
         settings_env(socket_timeout=5)
         with pytest.raises(StreamConfigurationError, match="socket_timeout"):
-            check_stream_settings()
+            add_redis_streams(FastAPI())
+
+    def test_socket_timeout_is_checked_against_the_override(
+        self, settings_env: Any
+    ) -> None:
+        settings_env(socket_timeout=5)
+        add_redis_streams(FastAPI(), heartbeat_interval=2, alive_ttl=6)
 
     def test_other_features_never_see_the_checks(self, settings_env: Any) -> None:
         settings_env(socket_timeout=5)
@@ -598,10 +602,7 @@ class TestUnsupported:
     @pytest.fixture()
     def backend(self, settings_env: Any) -> StreamBackend:
         settings_env()
-        backend = StreamBackend(
-            lambda: MagicMock(),
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: MagicMock())
         backend._start(_StreamCapabilities(supported=False))
         return backend
 
@@ -625,10 +626,7 @@ class TestUnsupported:
         settings_env()
         client = MagicMock()
         client.execute_command = AsyncMock(return_value=[None, [1]])
-        backend = StreamBackend(
-            lambda: client,
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: client)
         assert await backend.detect() is False
         assert await backend.detect() is False
         assert client.execute_command.await_count == 1
@@ -640,10 +638,7 @@ class TestUnsupported:
         client.execute_command = AsyncMock(
             side_effect=[RedisConnectionError(), [[1], [1]]]
         )
-        backend = StreamBackend(
-            lambda: client,
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: client)
         assert await backend.detect() is None
         assert await backend.detect() is True
 
@@ -659,10 +654,7 @@ class TestUnsupported:
 class TestWriterValidation:
     async def test_invalid_names_fail_before_redis(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(
-            lambda: MagicMock(),
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: MagicMock())
         backend._start(_StreamCapabilities(supported=True))
         with pytest.raises(StreamInvalidName):
             await backend.open(scope="bad scope")
@@ -675,10 +667,7 @@ class TestWriterValidation:
         self, settings_env: Any
     ) -> None:
         settings_env()
-        backend = StreamBackend(
-            lambda: MagicMock(),
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: MagicMock())
         backend._start(_StreamCapabilities(supported=True))
         with pytest.raises(StreamInvalidName):
             await backend.cancel("../x", scope="chat:1")
@@ -689,22 +678,13 @@ class TestWriterValidation:
 
     def test_oversized_event(self, settings_env: Any) -> None:
         settings_env(stream_max_event_bytes=10)
-        backend = StreamBackend(
-            lambda: MagicMock(),
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: MagicMock())
         with pytest.raises(ValueError, match="stream_max_event_bytes"):
             backend._encode({"text": "a long payload"})
 
     def test_undecodable_payload_passes_as_text(self, settings_env: Any) -> None:
         settings_env()
-        assert (
-            StreamBackend(
-                lambda: MagicMock(),
-                settings=StreamSettings.from_redis_settings(get_settings()),
-            )._decode(b"not json")
-            == "not json"
-        )
+        assert StreamBackend(lambda: MagicMock())._decode(b"not json") == "not json"
 
 
 class TestDurations:
@@ -741,20 +721,14 @@ class TestSpawnGuards:
 
     async def test_a_retry_handle_is_refused(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(
-            lambda: MagicMock(),
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: MagicMock())
         with pytest.raises(ValueError, match="created"):
             backend.spawn(self._writer(backend, created=False), _noop)
         assert not backend._spawned
 
     async def test_a_writer_is_spawned_once(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(
-            lambda: MagicMock(),
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: MagicMock())
         writer = self._writer(backend, created=True)
         writer._task = asyncio.get_running_loop().create_future()  # type: ignore[assignment]
         with pytest.raises(ValueError, match="already runs"):
@@ -762,10 +736,7 @@ class TestSpawnGuards:
 
     async def test_a_retry_handle_cannot_extend(self, settings_env: Any) -> None:
         settings_env()
-        backend = StreamBackend(
-            lambda: MagicMock(),
-            settings=StreamSettings.from_redis_settings(get_settings()),
-        )
+        backend = StreamBackend(lambda: MagicMock())
         with pytest.raises(StreamFenced):
             await self._writer(backend, created=False).extend(60)
 
@@ -870,10 +841,7 @@ class _Client:
 
 
 def _started_backend(client: _Client) -> StreamBackend:
-    backend = StreamBackend(
-        lambda: client,
-        settings=StreamSettings.from_redis_settings(get_settings()),
-    )
+    backend = StreamBackend(lambda: client)
     backend._start(_StreamCapabilities(supported=True))
     return backend
 
