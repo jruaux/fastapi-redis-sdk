@@ -104,6 +104,7 @@ M_CANCEL = "cancel"
 M_FINAL = "final"
 M_WRITER = "writer"
 M_STARTED = "started"
+_META_FIELDS = (M_STATUS, M_CANCEL, M_FINAL, M_WRITER, M_STARTED)
 
 STATUS_RUNNING = "running"
 STATUS_FINISHED = "finished"
@@ -238,19 +239,56 @@ def _keys(scope: str, stream_id: str) -> _Keys:
     )
 
 
+def _meta_reply(reply: Any) -> dict[str, str]:
+    """Decode the fixed metadata fields read by a transactional HMGET."""
+    if isinstance(reply, Exception):
+        raise StreamStoreError("could not read stream metadata") from reply
+    if not isinstance(reply, (list, tuple)) or len(reply) != len(_META_FIELDS):
+        raise StreamStoreError("invalid stream metadata reply")
+    try:
+        return {
+            field: text
+            for field, value in zip(_META_FIELDS, reply, strict=True)
+            if (text := _text(value)) is not None
+        }
+    except UnicodeError as exc:
+        raise StreamStoreError("invalid stream metadata encoding") from exc
+
+
 def _xread_entries(reply: Any) -> list[tuple[Any, dict[Any, Any]]]:
-    """Normalize an ``XREAD`` reply for one stream, RESP2 or RESP3."""
+    """Normalize one stream's RESP2 or legacy/modern RESP3 XREAD reply."""
+    if reply is None:
+        return []
+    if not isinstance(reply, (dict, list, tuple)):
+        raise StreamStoreError("invalid stream read reply")
     if not reply:
         return []
-    if isinstance(reply, dict):  # RESP3: {name: [entries]}
-        streams = list(reply.values())
-        if not streams:
-            return []
-        first = streams[0]
-        if first and isinstance(first[0], list):
-            return list(first[0])
-        return list(first)
-    return list(reply[0][1])  # RESP2: [[name, entries]]
+    if len(reply) != 1:
+        raise StreamStoreError("expected one stream in the read reply")
+    try:
+        entries = next(iter(reply.values())) if isinstance(reply, dict) else reply[0][1]
+        if not isinstance(entries, (list, tuple)):
+            raise ValueError
+        # Legacy RESP3 wraps the entry sequence once; modern RESP3 does not.
+        if (
+            len(entries) == 1
+            and isinstance(entries[0], (list, tuple))
+            and (not entries[0] or isinstance(entries[0][0], (list, tuple)))
+        ):
+            entries = entries[0]
+        result = []
+        for entry in entries:
+            if (
+                not isinstance(entry, (list, tuple))
+                or len(entry) != 2
+                or not isinstance(entry[0], (bytes, str))
+                or not isinstance(entry[1], dict)
+            ):
+                raise ValueError
+            result.append((entry[0], entry[1]))
+        return result
+    except (IndexError, TypeError, ValueError) as exc:
+        raise StreamStoreError("invalid stream read reply") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -894,10 +932,10 @@ class StreamBackend:
         client = self._client()
         try:
             pipe = client.pipeline(transaction=True)
-            pipe.hgetall(keys.meta)
+            pipe.hmget(keys.meta, _META_FIELDS)
             pipe.xrevrange(keys.stream, count=1)
             meta_raw, last = await pipe.execute()
-            meta = {_text(k): _text(v) for k, v in (meta_raw or {}).items()}
+            meta = _meta_reply(meta_raw)
             if not meta:
                 raise StreamNotFound(f"no stream {stream_id} in this scope")
             if meta.get(M_STATUS) == STATUS_FINISHED:
@@ -1103,12 +1141,15 @@ class StreamBackend:
         page = get_settings().stream_replay_page
 
         def build(pipe: Any) -> None:
-            pipe.hgetall(keys.meta)
+            pipe.hmget(keys.meta, _META_FIELDS)
             pipe.exists(keys.stream)
             pipe.xinfo_stream(keys.stream)
             if cursor != _START:
                 pipe.xrange(keys.stream, _format(cursor), _format(cursor))
-            pipe.xread({keys.stream: _format(cursor)}, count=page)
+            # XRANGE is equivalent to a nonblocking XREAD after this cursor.
+            # Its fixed key position avoids ClusterPipeline key discovery on a
+            # separate event loop in redis-py 8.0.1/8.1.0.
+            pipe.xrange(keys.stream, min=f"({_format(cursor)}", count=page)
 
         try:
             pipe = self._client().pipeline(transaction=True)
@@ -1120,7 +1161,7 @@ class StreamBackend:
             if isinstance(reply, Exception):
                 raise StreamStoreError("could not read the stream") from reply
 
-        meta = {_text(k): _text(v) for k, v in (replies[0] or {}).items()}
+        meta = _meta_reply(replies[0])
         if not meta:
             record_stream_operation(operation="read", result="not_found")
             raise StreamNotFound(f"no stream {stream_id} in this scope")
@@ -1153,7 +1194,9 @@ class StreamBackend:
             last_seq = int(seq_text) if seq_text else None
         first_reply = replies[-1]
         first = (
-            [] if isinstance(first_reply, Exception) else _xread_entries(first_reply)
+            []
+            if isinstance(first_reply, Exception)
+            else _xread_entries([[keys.stream, first_reply]])
         )
         record_stream_operation(
             operation="read", result="started" if cursor == _START else "resumed"
